@@ -1,0 +1,1585 @@
+/**
+ * KoKive Admin Shorts Controller v2
+ * 쇼츠폼 콘텐츠 제작 자동화 파이프라인 (FR-013, FR-014)
+ *
+ * Features:
+ * - Auto script generation from paper summary
+ * - Google Cloud TTS voice synthesis integration
+ * - Full pipeline automation
+ */
+
+const { query, queryOne, paginate, insert, update, remove, transaction } = require('../config/database');
+const { HTTP_STATUS, ERROR_CODES, SHORTS_STATUS, SHORTS_PLATFORMS, SUMMARY_LENGTHS } = require('../config/constants');
+const http = require('http');
+const https = require('https');
+const fs = require('fs');
+const path = require('path');
+const aiService = require('../services/aiService');
+
+// Google Cloud TTS 서비스 계정 라이브러리
+const textToSpeech = require('@google-cloud/text-to-speech');
+
+// Google Cloud TTS 클라이언트 (서비스 계정 인증)
+let ttsClient = null;
+const GOOGLE_CREDENTIALS_PATH = path.join(__dirname, '../../config/google-tts-credentials.json');
+
+/**
+ * Google TTS 클라이언트 초기화 (서비스 계정 방식)
+ */
+function initGoogleTTSClient() {
+    if (ttsClient) return ttsClient;
+
+    try {
+        if (fs.existsSync(GOOGLE_CREDENTIALS_PATH)) {
+            const credentials = JSON.parse(fs.readFileSync(GOOGLE_CREDENTIALS_PATH, 'utf8'));
+            ttsClient = new textToSpeech.TextToSpeechClient({
+                credentials: credentials
+            });
+            console.log('Google TTS client initialized with service account');
+        } else {
+            console.warn('Google TTS credentials file not found:', GOOGLE_CREDENTIALS_PATH);
+        }
+    } catch (error) {
+        console.error('Failed to initialize Google TTS client:', error.message);
+    }
+
+    return ttsClient;
+}
+
+// Google Cloud TTS API 설정 (레거시 호환용)
+const GOOGLE_TTS_API_URL = 'https://texttospeech.googleapis.com/v1/text:synthesize';
+
+// ImagineArt API 설정
+const IMAGINEART_API_URL = 'https://api.vyro.ai/v2/image/generations';
+
+// 오디오/비디오/이미지 저장 경로
+const AUDIO_OUTPUT_DIR = path.join(__dirname, '../../public/audio/shorts');
+const VIDEO_OUTPUT_DIR = path.join(__dirname, '../../public/video/shorts');
+const IMAGE_OUTPUT_DIR = path.join(__dirname, '../../public/images/shorts');
+
+// 디렉토리 생성 확인
+function ensureDir(dir) {
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+    }
+}
+
+// ==========================================
+// Google Cloud TTS 연동 함수
+// ==========================================
+
+/**
+ * Google Cloud TTS API 호출
+ */
+function googleTTSRequest(apiKey, requestBody) {
+    return new Promise((resolve, reject) => {
+        const bodyStr = JSON.stringify(requestBody);
+        const url = new URL(GOOGLE_TTS_API_URL);
+
+        const options = {
+            hostname: url.hostname,
+            port: 443,
+            path: `${url.pathname}?key=${apiKey}`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(bodyStr, 'utf8')
+            },
+            timeout: 60000  // 1분 타임아웃
+        };
+
+        const req = https.request(options, (res) => {
+            const chunks = [];
+
+            res.on('data', (chunk) => {
+                chunks.push(chunk);
+            });
+
+            res.on('end', () => {
+                const data = Buffer.concat(chunks).toString('utf-8');
+
+                try {
+                    const jsonResponse = JSON.parse(data);
+                    resolve({
+                        statusCode: res.statusCode,
+                        body: jsonResponse
+                    });
+                } catch (e) {
+                    resolve({
+                        statusCode: res.statusCode,
+                        body: data
+                    });
+                }
+            });
+        });
+
+        req.on('error', (error) => {
+            reject(error);
+        });
+
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('Google TTS request timeout'));
+        });
+
+        req.write(bodyStr);
+        req.end();
+    });
+}
+
+/**
+ * Google TTS 서비스 상태 확인 (서비스 계정 방식)
+ */
+async function checkGoogleTTSStatus() {
+    try {
+        // 서비스 계정 파일 존재 여부 확인
+        if (!fs.existsSync(GOOGLE_CREDENTIALS_PATH)) {
+            return { status: false, message: '서비스 계정 파일이 없습니다. JSON 파일을 업로드해주세요.' };
+        }
+
+        const client = initGoogleTTSClient();
+        if (!client) {
+            return { status: false, message: 'TTS 클라이언트 초기화 실패' };
+        }
+
+        // 간단한 테스트 요청
+        const request = {
+            input: { text: '테스트' },
+            voice: { languageCode: 'ko-KR', name: 'ko-KR-Wavenet-A', ssmlGender: 'FEMALE' },
+            audioConfig: { audioEncoding: 'MP3' }
+        };
+
+        const [response] = await client.synthesizeSpeech(request);
+        return {
+            status: true,
+            message: 'Google TTS 연결 성공',
+            audioLength: response.audioContent ? response.audioContent.length : 0
+        };
+    } catch (error) {
+        console.error('Google TTS status check failed:', error.message);
+        return { status: false, message: error.message };
+    }
+}
+
+/**
+ * Google TTS 음성 옵션 매핑
+ */
+function getGoogleVoiceConfig(voiceType = 'female', speed = 1.0) {
+    // 한국어 음성 옵션
+    const voiceMap = {
+        'female': { languageCode: 'ko-KR', name: 'ko-KR-Wavenet-A', ssmlGender: 'FEMALE' },
+        'male': { languageCode: 'ko-KR', name: 'ko-KR-Wavenet-C', ssmlGender: 'MALE' },
+        'female-neural': { languageCode: 'ko-KR', name: 'ko-KR-Neural2-A', ssmlGender: 'FEMALE' },
+        'male-neural': { languageCode: 'ko-KR', name: 'ko-KR-Neural2-C', ssmlGender: 'MALE' },
+        // 기본값 (이전 MeloTTS 'KR' 호환)
+        'KR': { languageCode: 'ko-KR', name: 'ko-KR-Wavenet-A', ssmlGender: 'FEMALE' }
+    };
+
+    const voice = voiceMap[voiceType] || voiceMap['female'];
+
+    return {
+        voice: voice,
+        audioConfig: {
+            audioEncoding: 'MP3',
+            speakingRate: parseFloat(speed) || 1.0,
+            pitch: 0,
+            sampleRateHertz: 24000  // MP3 최적 샘플레이트
+        }
+    };
+}
+
+/**
+ * 텍스트를 음성으로 변환하고 파일로 저장 (Google TTS - 서비스 계정 방식)
+ * @param {string} text - 변환할 텍스트
+ * @param {string} outputPath - 출력 파일 경로
+ * @param {Object} options - 옵션 (voice, speed, paperId, shortsId)
+ */
+async function synthesizeSpeech(text, outputPath, options = {}) {
+    const {
+        voice = 'female',
+        speed = 1.0,
+        paperId = null,
+        shortsId = null
+    } = options;
+
+    const client = initGoogleTTSClient();
+    if (!client) {
+        throw new Error('Google TTS 서비스 계정이 설정되지 않았습니다. JSON 파일을 업로드해주세요.');
+    }
+
+    const voiceConfig = getGoogleVoiceConfig(voice, speed);
+    const characterCount = text.length;
+    const startTime = Date.now();
+
+    const request = {
+        input: { text: text },
+        voice: voiceConfig.voice,
+        audioConfig: voiceConfig.audioConfig
+    };
+
+    try {
+        const [response] = await client.synthesizeSpeech(request);
+        const responseTime = Date.now() - startTime;
+
+        if (!response.audioContent) {
+            // 실패 로깅
+            await aiService.logTTSUsage('google', characterCount, responseTime, false, 'No audio content', {
+                paperId: paperId,
+                shortsId: shortsId,
+                voice: voiceConfig.voice.name
+            });
+            throw new Error('TTS synthesis failed - no audio content');
+        }
+
+        // 확장자를 .mp3로 변경 (Google TTS는 MP3 반환)
+        const mp3Path = outputPath.replace('.wav', '.mp3');
+        fs.writeFileSync(mp3Path, response.audioContent);
+
+        // 성공 로깅 - API 사용량 추적
+        const audioLengthSeconds = Math.ceil(response.audioContent.length / 24000); // 대략적인 오디오 길이 추정
+        await aiService.logTTSUsage('google', characterCount, responseTime, true, null, {
+            paperId: paperId,
+            shortsId: shortsId,
+            voice: voiceConfig.voice.name,
+            audioLengthSeconds: audioLengthSeconds
+        });
+
+        console.log(`TTS API logged: ${characterCount} chars, ${responseTime}ms, voice: ${voiceConfig.voice.name}`);
+
+        return {
+            path: mp3Path,
+            size: response.audioContent.length,
+            characterCount: characterCount,
+            responseTimeMs: responseTime
+        };
+    } catch (error) {
+        const responseTime = Date.now() - startTime;
+        // 에러 로깅
+        await aiService.logTTSUsage('google', characterCount, responseTime, false, error.message, {
+            paperId: paperId,
+            shortsId: shortsId,
+            voice: voiceConfig.voice.name
+        });
+        console.error('Google TTS synthesis error:', error.message);
+        throw new Error('음성 합성 실패: ' + error.message);
+    }
+}
+
+// ==========================================
+// ImagineArt 이미지 생성 함수
+// ==========================================
+
+/**
+ * ImagineArt API를 사용하여 이미지 생성
+ */
+async function generateImageWithImagineArt(prompt, apiKey, options = {}) {
+    const {
+        style = 'realistic',
+        aspectRatio = '9:16'  // 쇼츠용 세로 비율
+    } = options;
+
+    return new Promise((resolve, reject) => {
+        const boundary = '----FormBoundary' + Date.now().toString(16);
+
+        // Form data 구성
+        const formParts = [];
+        formParts.push(`--${boundary}\r\nContent-Disposition: form-data; name="prompt"\r\n\r\n${prompt}`);
+        formParts.push(`--${boundary}\r\nContent-Disposition: form-data; name="style"\r\n\r\n${style}`);
+        formParts.push(`--${boundary}\r\nContent-Disposition: form-data; name="aspect_ratio"\r\n\r\n${aspectRatio}`);
+        formParts.push(`--${boundary}--`);
+
+        const body = formParts.join('\r\n');
+
+        const urlObj = new URL(IMAGINEART_API_URL);
+        const reqOptions = {
+            hostname: urlObj.hostname,
+            port: 443,
+            path: urlObj.pathname,
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${apiKey}`,
+                'Content-Type': `multipart/form-data; boundary=${boundary}`,
+                'Content-Length': Buffer.byteLength(body)
+            },
+            timeout: 120000  // 2분 타임아웃
+        };
+
+        const req = https.request(reqOptions, (res) => {
+            const chunks = [];
+
+            res.on('data', (chunk) => {
+                chunks.push(chunk);
+            });
+
+            res.on('end', () => {
+                const data = Buffer.concat(chunks);
+
+                if (res.statusCode === 200) {
+                    // 성공 - 이미지 바이너리 반환
+                    resolve({
+                        success: true,
+                        data: data,
+                        contentType: res.headers['content-type'] || 'image/png'
+                    });
+                } else {
+                    // 에러 응답
+                    let errorMessage = `ImagineArt API error: ${res.statusCode}`;
+                    try {
+                        const errorBody = JSON.parse(data.toString());
+                        errorMessage = errorBody.message || errorBody.error || errorMessage;
+                    } catch (e) {
+                        // 파싱 실패 시 기본 메시지 사용
+                    }
+                    reject(new Error(errorMessage));
+                }
+            });
+        });
+
+        req.on('error', (error) => {
+            reject(new Error(`ImagineArt request failed: ${error.message}`));
+        });
+
+        req.on('timeout', () => {
+            req.destroy();
+            reject(new Error('ImagineArt request timeout'));
+        });
+
+        req.write(body);
+        req.end();
+    });
+}
+
+/**
+ * 논문 정보로부터 이미지 프롬프트 생성
+ */
+function generateImagePrompt(paper, category) {
+    const title = paper.title_ko || paper.title_en || 'AI Research';
+
+    // 카테고리별 기본 프롬프트 스타일
+    const categoryPrompts = {
+        'cs.AI': 'futuristic AI neural network visualization, digital brain, blue and purple neon lights',
+        'cs.LG': 'machine learning data visualization, abstract flowing data streams, tech aesthetic',
+        'cs.CV': 'computer vision and image recognition, digital eye with data overlay',
+        'cs.CL': 'natural language processing, floating text and symbols, communication',
+        'cs.RO': 'advanced robotics and automation, mechanical precision',
+        'default': 'cutting-edge technology, abstract digital visualization, professional'
+    };
+
+    const categoryStyle = categoryPrompts[category] || categoryPrompts['default'];
+
+    // 쇼츠 썸네일용 프롬프트 (세로 9:16 비율에 적합)
+    return `${categoryStyle}, modern tech presentation style, high quality, vertical format, cinematic lighting, 4K`;
+}
+
+/**
+ * ImagineArt로 썸네일 이미지 생성 및 저장
+ */
+async function createThumbnailImage(paper, shortsId, settings = {}) {
+    const {
+        imageApiKey,
+        imageStyle = 'realistic'
+    } = settings;
+
+    if (!imageApiKey) {
+        throw new Error('ImagineArt API key is not configured');
+    }
+
+    ensureDir(IMAGE_OUTPUT_DIR);
+
+    const category = paper.primary_category || 'default';
+    const prompt = generateImagePrompt(paper, category);
+
+    console.log(`Generating thumbnail image for shorts ${shortsId}, prompt: ${prompt.substring(0, 100)}...`);
+
+    const result = await generateImageWithImagineArt(prompt, imageApiKey, {
+        style: imageStyle,
+        aspectRatio: '9:16'  // 쇼츠용 세로 비율
+    });
+
+    // 파일 확장자 결정
+    const ext = result.contentType.includes('jpeg') ? 'jpg' : 'png';
+    const filename = `shorts_${shortsId}_${Date.now()}.${ext}`;
+    const filepath = path.join(IMAGE_OUTPUT_DIR, filename);
+
+    // 이미지 저장
+    fs.writeFileSync(filepath, result.data);
+
+    console.log(`Thumbnail image saved: ${filepath} (${result.data.length} bytes)`);
+
+    return {
+        url: `/images/shorts/${filename}`,
+        path: filepath,
+        size: result.data.length
+    };
+}
+
+// ==========================================
+// 스크립트 자동 생성 함수
+// ==========================================
+
+/**
+ * 논문 정보로부터 쇼츠 스크립트 자동 생성
+ * 구조: 소개멘트 -> TLDR -> 쉬운해설 -> 비즈니스요약 -> 마무리멘트
+ */
+function generateScript(paper, settings = {}) {
+    const title = paper.title_ko || paper.title_en || '최신 AI 연구';
+    const tldr = paper.tldr || '';
+    const summary3line = paper.summary_3line || paper.summary_detailed || '';
+    const businessInsight = paper.business_insight || '';
+
+    // 기본 템플릿 (설정에서 가져오거나 기본값 사용)
+    const introScript = settings.introScript || '안녕하세요! 오늘도 최신 AI 논문을 쉽게 풀어드립니다.';
+    const outroScript = settings.outroScript || '더 자세한 내용이 궁금하시다면 프로필 링크를 확인해주세요. 구독과 좋아요 부탁드립니다!';
+    const transitionWord = settings.transitionWord || '자, 그럼';
+
+    // Hook = 소개멘트
+    const hook = introScript;
+
+    // Main = TLDR + 쉬운해설 + 비즈니스요약 조합
+    let mainParts = [];
+
+    if (tldr) {
+        mainParts.push(transitionWord + ' 핵심 내용을 알아볼까요? ' + tldr);
+    }
+
+    if (summary3line) {
+        mainParts.push(transitionWord + ' 좀 더 쉽게 설명하면, ' + summary3line);
+    }
+
+    if (businessInsight) {
+        mainParts.push(transitionWord + ' 실제로 어떻게 활용될 수 있을까요? ' + businessInsight);
+    }
+
+    // main이 비어있으면 제목 기반 기본 내용 생성
+    if (mainParts.length === 0) {
+        mainParts.push(transitionWord + ' ' + title + '에 대한 최신 연구입니다.');
+    }
+
+    const main = mainParts.join(' ');
+
+    // CTA = 마무리멘트
+    const cta = outroScript;
+
+    // 썸네일 텍스트 생성
+    const thumbnailText = title.length <= 30 ? title : title.substring(0, 27) + '...';
+
+    return {
+        hook,
+        main,
+        cta,
+        thumbnailText,
+        // 전체 스크립트 (TTS용)
+        fullScript: hook + ' ' + main + ' ' + cta
+    };
+}
+
+// ==========================================
+// 쇼츠폼 목록 및 조회
+// ==========================================
+
+/**
+ * 쇼츠폼 목록 조회 (관리자)
+ */
+exports.getShorts = async (req, res, next) => {
+    try {
+        const { page = 1, limit = 20, status, platform, paperId } = req.query;
+
+        let whereClause = '1=1';
+        const params = [];
+
+        if (status) {
+            whereClause += ' AND s.status = ?';
+            params.push(status);
+        }
+
+        if (paperId) {
+            whereClause += ' AND s.paper_id = ?';
+            params.push(paperId);
+        }
+
+        if (platform) {
+            whereClause += ' AND EXISTS (SELECT 1 FROM shorts_platforms sp WHERE sp.shorts_id = s.id AND sp.platform = ?)';
+            params.push(platform);
+        }
+
+        const result = await paginate(`
+            SELECT
+                s.id,
+                s.paper_id,
+                s.title,
+                s.status,
+                s.thumbnail_url,
+                s.audio_url,
+                s.created_at,
+                s.updated_at,
+                p.title_ko as paper_title,
+                p.title_en as paper_title_en,
+                p.arxiv_id,
+                (SELECT GROUP_CONCAT(sp.platform) FROM shorts_platforms sp WHERE sp.shorts_id = s.id) as platforms,
+                (SELECT SUM(ss.views) FROM shorts_stats ss
+                 JOIN shorts_platforms sp ON ss.shorts_platform_id = sp.id
+                 WHERE sp.shorts_id = s.id) as total_views,
+                (SELECT SUM(ss.clicks) FROM shorts_stats ss
+                 JOIN shorts_platforms sp ON ss.shorts_platform_id = sp.id
+                 WHERE sp.shorts_id = s.id) as total_clicks
+            FROM shorts s
+            JOIN papers p ON s.paper_id = p.id
+            WHERE ${whereClause}
+        `, params, {
+            page: parseInt(page),
+            limit: parseInt(limit),
+            orderBy: 's.created_at DESC'
+        });
+
+        res.json({
+            success: true,
+            data: result.items.map(s => ({
+                id: s.id,
+                paperId: s.paper_id,
+                title: s.title,
+                status: s.status,
+                thumbnailUrl: s.thumbnail_url,
+                audioUrl: s.audio_url,
+                paper: {
+                    title: s.paper_title || s.paper_title_en || '제목 없음',
+                    titleKo: s.paper_title,
+                    titleEn: s.paper_title_en,
+                    arxivId: s.arxiv_id
+                },
+                platforms: s.platforms ? s.platforms.split(',') : [],
+                stats: {
+                    totalViews: s.total_views || 0,
+                    totalClicks: s.total_clicks || 0
+                },
+                createdAt: s.created_at,
+                updatedAt: s.updated_at
+            })),
+            pagination: result.pagination
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 쇼츠폼 상세 조회 (관리자)
+ */
+exports.getShortsById = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        const shorts = await queryOne(`
+            SELECT
+                s.*,
+                p.id as paper_id,
+                p.arxiv_id,
+                p.title_ko as paper_title,
+                p.title_en as paper_title_en,
+                p.primary_category,
+                ps.tldr,
+                ps.summary_3line,
+                ps.summary_detailed,
+                ps.business_insight
+            FROM shorts s
+            JOIN papers p ON s.paper_id = p.id
+            LEFT JOIN paper_summaries ps ON p.id = ps.paper_id
+            WHERE s.id = ?
+        `, [id]);
+
+        if (!shorts) {
+            return res.status(HTTP_STATUS.NOT_FOUND).json({
+                success: false,
+                error: { code: ERROR_CODES.NOT_FOUND, message: '쇼츠폼을 찾을 수 없습니다.' }
+            });
+        }
+
+        // 플랫폼 정보 조회
+        const platforms = await query(`
+            SELECT sp.*,
+                   (SELECT SUM(views) FROM shorts_stats WHERE shorts_platform_id = sp.id) as total_views,
+                   (SELECT SUM(clicks) FROM shorts_stats WHERE shorts_platform_id = sp.id) as total_clicks,
+                   (SELECT SUM(likes) FROM shorts_stats WHERE shorts_platform_id = sp.id) as total_likes,
+                   (SELECT SUM(comments) FROM shorts_stats WHERE shorts_platform_id = sp.id) as total_comments
+            FROM shorts_platforms sp
+            WHERE sp.shorts_id = ?
+        `, [id]);
+
+        res.json({
+            success: true,
+            data: {
+                id: shorts.id,
+                title: shorts.title,
+                status: shorts.status,
+                script: {
+                    hook: shorts.script_hook,
+                    main: shorts.script_main,
+                    cta: shorts.script_cta
+                },
+                thumbnail: {
+                    url: shorts.thumbnail_url,
+                    text: shorts.thumbnail_text
+                },
+                audio: {
+                    url: shorts.audio_url
+                },
+                paper: {
+                    id: shorts.paper_id,
+                    arxivId: shorts.arxiv_id,
+                    titleKo: shorts.paper_title,
+                    titleEn: shorts.paper_title_en,
+                    category: shorts.primary_category,
+                    tldr: shorts.tldr,
+                    summary3line: shorts.summary_3line,
+                    easyExplanation: shorts.summary_detailed,
+                    businessInsight: shorts.business_insight
+                },
+                platforms: platforms.map(p => ({
+                    id: p.id,
+                    platform: p.platform,
+                    videoUrl: p.video_url,
+                    trackingUrl: p.tracking_url,
+                    publishedAt: p.published_at,
+                    stats: {
+                        views: p.total_views || 0,
+                        clicks: p.total_clicks || 0,
+                        likes: p.total_likes || 0,
+                        comments: p.total_comments || 0
+                    }
+                })),
+                createdAt: shorts.created_at,
+                updatedAt: shorts.updated_at
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==========================================
+// 쇼츠폼 생성 및 수정 (자동화 파이프라인)
+// ==========================================
+
+/**
+ * 쇼츠폼 생성 (전체 파이프라인)
+ * 1. 논문 선택 (자동 또는 수동)
+ * 2. 스크립트 자동 생성
+ * 3. MeloTTS로 음성 생성
+ * 4. DB에 저장
+ */
+exports.createShorts = async (req, res, next) => {
+    try {
+        let {
+            paperId,
+            method,
+            title,
+            scriptHook,
+            scriptMain,
+            scriptCta,
+            thumbnailUrl,
+            thumbnailText,
+            // TTS 설정
+            ttsVoice = 'KR',
+            ttsSpeed = 1.0,
+            generateAudio = true
+        } = req.body;
+
+        // 디렉토리 확인
+        ensureDir(AUDIO_OUTPUT_DIR);
+
+        // 1. 논문 선택 (자동 또는 수동)
+        if (method === 'auto' || !paperId) {
+            const candidatePaper = await queryOne(`
+                SELECT p.id, p.title_ko
+                FROM papers p
+                WHERE DATE(p.created_at) = CURDATE()
+                  AND p.processing_status = 'completed'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM shorts s WHERE s.paper_id = p.id
+                  )
+                ORDER BY RAND()
+                LIMIT 1
+            `);
+
+            if (!candidatePaper) {
+                const recentPaper = await queryOne(`
+                    SELECT p.id, p.title_ko
+                    FROM papers p
+                    WHERE p.created_at >= DATE_SUB(CURDATE(), INTERVAL 7 DAY)
+                      AND p.processing_status = 'completed'
+                      AND NOT EXISTS (
+                          SELECT 1 FROM shorts s WHERE s.paper_id = p.id
+                      )
+                    ORDER BY RAND()
+                    LIMIT 1
+                `);
+
+                if (!recentPaper) {
+                    return res.status(HTTP_STATUS.BAD_REQUEST).json({
+                        success: false,
+                        error: {
+                            code: ERROR_CODES.VALIDATION_ERROR,
+                            message: '자동 선택할 수 있는 논문이 없습니다. 모든 최근 논문에 이미 쇼츠가 생성되었거나 수집된 논문이 없습니다.'
+                        }
+                    });
+                }
+                paperId = recentPaper.id;
+            } else {
+                paperId = candidatePaper.id;
+            }
+        }
+
+        // 2. 논문 정보 조회 (요약 포함)
+        const paper = await queryOne(`
+            SELECT p.*, ps.tldr, ps.summary_3line, ps.business_insight
+            FROM papers p
+            LEFT JOIN paper_summaries ps ON p.id = ps.paper_id
+            WHERE p.id = ?
+        `, [paperId]);
+
+        if (!paper) {
+            return res.status(HTTP_STATUS.NOT_FOUND).json({
+                success: false,
+                error: { code: ERROR_CODES.NOT_FOUND, message: '논문을 찾을 수 없습니다.' }
+            });
+        }
+
+        // 3. 설정 로드 및 스크립트 생성
+        let script;
+        let scriptSettings = {};
+        try {
+            const settingsRow = await queryOne(
+                "SELECT setting_value FROM system_settings WHERE setting_key = 'shorts_engine_settings'"
+            );
+            if (settingsRow && settingsRow.setting_value) {
+                scriptSettings = JSON.parse(settingsRow.setting_value);
+            }
+        } catch (e) {
+            console.log('Could not load script settings, using defaults');
+        }
+
+        if (!scriptHook && !scriptMain && !scriptCta) {
+            script = generateScript(paper, scriptSettings);
+            scriptHook = script.hook;
+            scriptMain = script.main;
+            scriptCta = script.cta;
+            thumbnailText = thumbnailText || script.thumbnailText;
+        } else {
+            script = {
+                hook: scriptHook || '',
+                main: scriptMain || '',
+                cta: scriptCta || '',
+                fullScript: `${scriptHook || ''} ${scriptMain || ''} ${scriptCta || ''}`
+            };
+        }
+
+        // 타이틀 설정
+        if (!title) {
+            title = paper.title_ko || paper.title_en || '새 쇼츠';
+        }
+
+        // 4. DB에 쇼츠 레코드 생성 (먼저 ID 획득)
+        const shortsId = await insert('shorts', {
+            paper_id: paperId,
+            title,
+            script_hook: scriptHook,
+            script_main: scriptMain,
+            script_cta: scriptCta,
+            thumbnail_url: thumbnailUrl,
+            thumbnail_text: thumbnailText,
+            status: SHORTS_STATUS.DRAFT
+        });
+
+        // 5. Google TTS로 음성 생성
+        let audioUrl = null;
+        let audioError = null;
+
+        if (generateAudio) {
+            try {
+                // Google TTS API 키 확인
+                const googleTtsApiKey = scriptSettings.googleTtsApiKey || scriptSettings.ttsApiKey;
+                const isReady = await checkGoogleTTSStatus(googleTtsApiKey);
+
+                if (isReady) {
+                    const audioFilename = `shorts_${shortsId}_${Date.now()}.mp3`;
+                    const audioPath = path.join(AUDIO_OUTPUT_DIR, audioFilename);
+
+                    // 설정에서 Google TTS 옵션 가져오기 (요청 파라미터 > 저장된 설정 > 기본값)
+                    const finalVoice = ttsVoice || scriptSettings.googleTtsVoice || 'female';
+                    const finalSpeed = parseFloat(ttsSpeed || scriptSettings.googleTtsSpeed || 1.0);
+
+                    console.log(`Google TTS settings: voice=${finalVoice}, speed=${finalSpeed}`);
+
+                    // 음성 합성 (API 사용량 추적 포함)
+                    const audioResult = await synthesizeSpeech(script.fullScript, audioPath, {
+                        apiKey: googleTtsApiKey,
+                        voice: finalVoice,
+                        speed: finalSpeed,
+                        paperId: paperId,
+                        shortsId: shortsId
+                    });
+
+                    audioUrl = `/audio/shorts/${audioFilename}`;
+
+                    // DB 업데이트
+                    await query('UPDATE shorts SET audio_url = ?, status = ? WHERE id = ?', [
+                        audioUrl,
+                        SHORTS_STATUS.READY,
+                        shortsId
+                    ]);
+
+                    console.log(`Audio generated for shorts ${shortsId}: ${audioResult.size} bytes`);
+                } else {
+                    audioError = 'Google TTS API 키가 설정되지 않았거나 유효하지 않습니다.';
+                    console.warn('Google TTS service not ready');
+                }
+            } catch (ttsError) {
+                audioError = ttsError.message;
+                console.error('TTS generation failed:', ttsError.message);
+            }
+        }
+
+        // 6. ImagineArt로 썸네일 이미지 생성 (thumbnailUrl이 없는 경우에만)
+        let imageError = null;
+        if (!thumbnailUrl && scriptSettings.imageApiKey && scriptSettings.imageProvider === 'imagineart') {
+            try {
+                console.log('Generating thumbnail image with ImagineArt...');
+                const imageResult = await createThumbnailImage(paper, shortsId, {
+                    imageApiKey: scriptSettings.imageApiKey,
+                    imageStyle: scriptSettings.imageStyle || 'realistic'
+                });
+
+                thumbnailUrl = imageResult.url;
+
+                // DB 업데이트
+                await query('UPDATE shorts SET thumbnail_url = ? WHERE id = ?', [
+                    thumbnailUrl,
+                    shortsId
+                ]);
+
+                console.log(`Thumbnail image generated for shorts ${shortsId}: ${imageResult.size} bytes`);
+            } catch (imageErr) {
+                imageError = imageErr.message;
+                console.error('Image generation failed:', imageErr.message);
+            }
+        }
+
+        res.status(HTTP_STATUS.CREATED).json({
+            success: true,
+            message: '쇼츠폼이 생성되었습니다.',
+            data: {
+                shortsId,
+                title,
+                script: {
+                    hook: scriptHook,
+                    main: scriptMain,
+                    cta: scriptCta
+                },
+                thumbnailText,
+                thumbnailUrl,
+                audioUrl,
+                audioError,
+                imageError,
+                paper: {
+                    id: paper.id,
+                    title: paper.title_ko || paper.title_en
+                },
+                status: audioUrl ? SHORTS_STATUS.READY : SHORTS_STATUS.DRAFT
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 쇼츠폼 수정
+ */
+exports.updateShorts = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const {
+            title,
+            scriptHook,
+            scriptMain,
+            scriptCta,
+            thumbnailUrl,
+            thumbnailText,
+            regenerateAudio = false,
+            ttsVoice = 'KR',
+            ttsSpeed = 1.0
+        } = req.body;
+
+        const updateData = {};
+        if (title) updateData.title = title;
+        if (scriptHook !== undefined) updateData.script_hook = scriptHook;
+        if (scriptMain !== undefined) updateData.script_main = scriptMain;
+        if (scriptCta !== undefined) updateData.script_cta = scriptCta;
+        if (thumbnailUrl !== undefined) updateData.thumbnail_url = thumbnailUrl;
+        if (thumbnailText !== undefined) updateData.thumbnail_text = thumbnailText;
+
+        // 스크립트가 변경되고 regenerateAudio가 true이면 오디오 재생성
+        if (regenerateAudio && (scriptHook || scriptMain || scriptCta)) {
+            try {
+                // 설정에서 Google TTS API 키 가져오기
+                let scriptSettings = {};
+                try {
+                    const settingsRow = await queryOne(
+                        "SELECT setting_value FROM system_settings WHERE setting_key = 'shorts_engine_settings'"
+                    );
+                    if (settingsRow && settingsRow.setting_value) {
+                        scriptSettings = JSON.parse(settingsRow.setting_value);
+                    }
+                } catch (e) {
+                    console.log('Could not load script settings for regeneration');
+                }
+
+                const googleTtsApiKey = scriptSettings.googleTtsApiKey || scriptSettings.ttsApiKey;
+                const isReady = await checkGoogleTTSStatus(googleTtsApiKey);
+
+                if (isReady) {
+                    ensureDir(AUDIO_OUTPUT_DIR);
+
+                    // paper_id 조회 (API 로깅용)
+                    const shortsInfo = await queryOne('SELECT paper_id FROM shorts WHERE id = ?', [id]);
+                    const paperId = shortsInfo?.paper_id || null;
+
+                    const fullScript = `${scriptHook || ''} ${scriptMain || ''} ${scriptCta || ''}`.trim();
+                    const audioFilename = `shorts_${id}_${Date.now()}.mp3`;
+                    const audioPath = path.join(AUDIO_OUTPUT_DIR, audioFilename);
+
+                    // 음성 합성 (API 사용량 추적 포함)
+                    await synthesizeSpeech(fullScript, audioPath, {
+                        apiKey: googleTtsApiKey,
+                        voice: ttsVoice || scriptSettings.googleTtsVoice || 'female',
+                        speed: parseFloat(ttsSpeed),
+                        paperId: paperId,
+                        shortsId: parseInt(id)
+                    });
+
+                    updateData.audio_url = `/audio/shorts/${audioFilename}`;
+                }
+            } catch (ttsError) {
+                console.error('Audio regeneration failed:', ttsError.message);
+            }
+        }
+
+        if (Object.keys(updateData).length > 0) {
+            await query(
+                `UPDATE shorts SET ${Object.keys(updateData).map(k => `${k} = ?`).join(', ')} WHERE id = ?`,
+                [...Object.values(updateData), id]
+            );
+        }
+
+        res.json({
+            success: true,
+            message: '쇼츠폼이 수정되었습니다.',
+            audioRegenerated: !!updateData.audio_url
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 쇼츠폼 삭제
+ */
+exports.deleteShorts = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+
+        // 오디오 파일 삭제
+        const shorts = await queryOne('SELECT audio_url FROM shorts WHERE id = ?', [id]);
+        if (shorts && shorts.audio_url) {
+            const audioPath = path.join(__dirname, '../../public', shorts.audio_url);
+            if (fs.existsSync(audioPath)) {
+                fs.unlinkSync(audioPath);
+            }
+        }
+
+        await query('DELETE FROM shorts WHERE id = ?', [id]);
+
+        res.json({
+            success: true,
+            message: '쇼츠폼이 삭제되었습니다.'
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==========================================
+// AI 스크립트 생성 (미리보기)
+// ==========================================
+
+/**
+ * AI 스크립트 생성 (미리보기용)
+ */
+exports.generateScript = async (req, res, next) => {
+    try {
+        const { paperId, style = 'engaging' } = req.body;
+
+        const paper = await queryOne(`
+            SELECT p.*, ps.tldr, ps.summary_3line, ps.business_insight
+            FROM papers p
+            LEFT JOIN paper_summaries ps ON p.id = ps.paper_id
+            WHERE p.id = ?
+        `, [paperId]);
+
+        if (!paper) {
+            return res.status(HTTP_STATUS.NOT_FOUND).json({
+                success: false,
+                error: { code: ERROR_CODES.NOT_FOUND, message: '논문을 찾을 수 없습니다.' }
+            });
+        }
+
+        const script = generateScript(paper);
+
+        res.json({
+            success: true,
+            data: {
+                script: {
+                    hook: script.hook,
+                    main: script.main,
+                    cta: script.cta,
+                    thumbnailText: script.thumbnailText
+                },
+                paper: {
+                    id: paper.id,
+                    title: paper.title_ko || paper.title_en,
+                    category: paper.primary_category
+                }
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==========================================
+// 플랫폼 관리
+// ==========================================
+
+/**
+ * 플랫폼 정보 추가/수정
+ */
+exports.updatePlatform = async (req, res, next) => {
+    try {
+        const { shortsId } = req.params;
+        const { platform, videoUrl, trackingUrl } = req.body;
+
+        if (!Object.values(SHORTS_PLATFORMS).includes(platform)) {
+            return res.status(HTTP_STATUS.BAD_REQUEST).json({
+                success: false,
+                error: { code: ERROR_CODES.VALIDATION_ERROR, message: '유효하지 않은 플랫폼입니다.' }
+            });
+        }
+
+        const existing = await queryOne(
+            'SELECT id FROM shorts_platforms WHERE shorts_id = ? AND platform = ?',
+            [shortsId, platform]
+        );
+
+        if (existing) {
+            await query(
+                'UPDATE shorts_platforms SET video_url = ?, tracking_url = ? WHERE id = ?',
+                [videoUrl, trackingUrl, existing.id]
+            );
+        } else {
+            await insert('shorts_platforms', {
+                shorts_id: shortsId,
+                platform,
+                video_url: videoUrl,
+                tracking_url: trackingUrl
+            });
+        }
+
+        res.json({
+            success: true,
+            message: '플랫폼 정보가 업데이트되었습니다.'
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 플랫폼 정보 삭제
+ */
+exports.deletePlatform = async (req, res, next) => {
+    try {
+        const { shortsId, platform } = req.params;
+
+        await query('DELETE FROM shorts_platforms WHERE shorts_id = ? AND platform = ?', [shortsId, platform]);
+
+        res.json({
+            success: true,
+            message: '플랫폼 정보가 삭제되었습니다.'
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==========================================
+// 상태 관리
+// ==========================================
+
+/**
+ * 쇼츠폼 상태 변경
+ */
+exports.updateStatus = async (req, res, next) => {
+    try {
+        const { id } = req.params;
+        const { status } = req.body;
+
+        if (!Object.values(SHORTS_STATUS).includes(status)) {
+            return res.status(HTTP_STATUS.BAD_REQUEST).json({
+                success: false,
+                error: { code: ERROR_CODES.VALIDATION_ERROR, message: '유효하지 않은 상태입니다.' }
+            });
+        }
+
+        if (status === SHORTS_STATUS.PUBLISHED) {
+            await query(
+                'UPDATE shorts_platforms SET published_at = NOW() WHERE shorts_id = ? AND published_at IS NULL',
+                [id]
+            );
+        }
+
+        await query('UPDATE shorts SET status = ? WHERE id = ?', [status, id]);
+
+        res.json({
+            success: true,
+            message: status === SHORTS_STATUS.PUBLISHED ? '쇼츠폼이 발행되었습니다.' : '쇼츠폼 상태가 변경되었습니다.'
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==========================================
+// 통계 및 분석
+// ==========================================
+
+/**
+ * 쇼츠폼 통계 입력/수정
+ */
+exports.updateStats = async (req, res, next) => {
+    try {
+        const { shortsId } = req.params;
+        const { platform, date, views, clicks, likes, comments, shares } = req.body;
+
+        const platformData = await queryOne(
+            'SELECT id FROM shorts_platforms WHERE shorts_id = ? AND platform = ?',
+            [shortsId, platform]
+        );
+
+        if (!platformData) {
+            return res.status(HTTP_STATUS.NOT_FOUND).json({
+                success: false,
+                error: { code: ERROR_CODES.NOT_FOUND, message: '플랫폼 정보를 찾을 수 없습니다.' }
+            });
+        }
+
+        const existingStats = await queryOne(
+            'SELECT id FROM shorts_stats WHERE shorts_platform_id = ? AND date = ?',
+            [platformData.id, date]
+        );
+
+        const statsData = {
+            views: views || 0,
+            clicks: clicks || 0,
+            likes: likes || 0,
+            comments: comments || 0,
+            shares: shares || 0
+        };
+
+        if (existingStats) {
+            await query(
+                'UPDATE shorts_stats SET views = ?, clicks = ?, likes = ?, comments = ?, shares = ? WHERE id = ?',
+                [statsData.views, statsData.clicks, statsData.likes, statsData.comments, statsData.shares, existingStats.id]
+            );
+        } else {
+            await insert('shorts_stats', {
+                shorts_platform_id: platformData.id,
+                date,
+                ...statsData
+            });
+        }
+
+        res.json({
+            success: true,
+            message: '통계가 업데이트되었습니다.'
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 쇼츠폼 성과 분석
+ */
+exports.getAnalytics = async (req, res, next) => {
+    try {
+        const { startDate, endDate, platform } = req.query;
+
+        let platformFilter = '';
+        const params = [];
+
+        if (startDate) {
+            params.push(startDate);
+        } else {
+            params.push(new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().split('T')[0]);
+        }
+
+        if (endDate) {
+            params.push(endDate);
+        } else {
+            params.push(new Date().toISOString().split('T')[0]);
+        }
+
+        if (platform) {
+            platformFilter = 'AND sp.platform = ?';
+            params.push(platform);
+        }
+
+        const totalStats = await queryOne(`
+            SELECT
+                SUM(ss.views) as total_views,
+                SUM(ss.clicks) as total_clicks,
+                SUM(ss.likes) as total_likes,
+                SUM(ss.comments) as total_comments,
+                SUM(ss.shares) as total_shares,
+                CASE WHEN SUM(ss.views) > 0
+                    THEN ROUND(SUM(ss.clicks) / SUM(ss.views) * 100, 2)
+                    ELSE 0 END as ctr
+            FROM shorts_stats ss
+            JOIN shorts_platforms sp ON ss.shorts_platform_id = sp.id
+            WHERE ss.date BETWEEN ? AND ? ${platformFilter}
+        `, params);
+
+        const dailyStats = await query(`
+            SELECT
+                ss.date,
+                SUM(ss.views) as views,
+                SUM(ss.clicks) as clicks,
+                SUM(ss.likes) as likes
+            FROM shorts_stats ss
+            JOIN shorts_platforms sp ON ss.shorts_platform_id = sp.id
+            WHERE ss.date BETWEEN ? AND ? ${platformFilter}
+            GROUP BY ss.date
+            ORDER BY ss.date ASC
+        `, params);
+
+        const platformStats = await query(`
+            SELECT
+                sp.platform,
+                SUM(ss.views) as views,
+                SUM(ss.clicks) as clicks,
+                SUM(ss.likes) as likes,
+                COUNT(DISTINCT sp.shorts_id) as shorts_count
+            FROM shorts_stats ss
+            JOIN shorts_platforms sp ON ss.shorts_platform_id = sp.id
+            WHERE ss.date BETWEEN ? AND ?
+            GROUP BY sp.platform
+        `, [params[0], params[1]]);
+
+        const topShorts = await query(`
+            SELECT
+                s.id,
+                s.title,
+                p.title_ko as paper_title,
+                SUM(ss.views) as total_views,
+                SUM(ss.clicks) as total_clicks,
+                CASE WHEN SUM(ss.views) > 0
+                    THEN ROUND(SUM(ss.clicks) / SUM(ss.views) * 100, 2)
+                    ELSE 0 END as ctr
+            FROM shorts s
+            JOIN papers p ON s.paper_id = p.id
+            JOIN shorts_platforms sp ON s.id = sp.shorts_id
+            JOIN shorts_stats ss ON sp.id = ss.shorts_platform_id
+            WHERE ss.date BETWEEN ? AND ? ${platformFilter}
+            GROUP BY s.id
+            ORDER BY total_views DESC
+            LIMIT 10
+        `, params);
+
+        res.json({
+            success: true,
+            data: {
+                period: {
+                    start: params[0],
+                    end: params[1]
+                },
+                totals: {
+                    views: totalStats.total_views || 0,
+                    clicks: totalStats.total_clicks || 0,
+                    likes: totalStats.total_likes || 0,
+                    comments: totalStats.total_comments || 0,
+                    shares: totalStats.total_shares || 0,
+                    ctr: totalStats.ctr || 0
+                },
+                daily: dailyStats.map(d => ({
+                    date: d.date,
+                    views: d.views || 0,
+                    clicks: d.clicks || 0,
+                    likes: d.likes || 0
+                })),
+                byPlatform: platformStats.map(p => ({
+                    platform: p.platform,
+                    views: p.views || 0,
+                    clicks: p.clicks || 0,
+                    likes: p.likes || 0,
+                    shortsCount: p.shorts_count
+                })),
+                topShorts: topShorts.map(s => ({
+                    id: s.id,
+                    title: s.title,
+                    paperTitle: s.paper_title,
+                    views: s.total_views || 0,
+                    clicks: s.total_clicks || 0,
+                    ctr: s.ctr
+                }))
+            }
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 쇼츠폼 추천 논문 목록
+ */
+exports.getRecommendedPapers = async (req, res, next) => {
+    try {
+        const { limit = 10 } = req.query;
+
+        const papers = await query(`
+            SELECT
+                p.id,
+                p.arxiv_id,
+                p.title_ko,
+                p.title_en,
+                p.primary_category,
+                p.published_at,
+                ps.tldr,
+                (SELECT AVG(rating) FROM paper_ratings WHERE paper_id = p.id) as avg_rating,
+                (SELECT COUNT(*) FROM paper_ratings WHERE paper_id = p.id) as rating_count
+            FROM papers p
+            LEFT JOIN paper_summaries ps ON p.id = ps.paper_id
+            WHERE p.processing_status = 'completed'
+              AND NOT EXISTS (SELECT 1 FROM shorts WHERE paper_id = p.id)
+            ORDER BY p.published_at DESC, rating_count DESC
+            LIMIT ?
+        `, [parseInt(limit)]);
+
+        res.json({
+            success: true,
+            data: papers.map(p => ({
+                id: p.id,
+                arxivId: p.arxiv_id,
+                titleKo: p.title_ko,
+                titleEn: p.title_en,
+                category: p.primary_category,
+                publishedAt: p.published_at,
+                tldr: p.tldr,
+                avgRating: p.avg_rating ? parseFloat(p.avg_rating).toFixed(1) : null,
+                ratingCount: p.rating_count
+            }))
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+// ==========================================
+// TTS 서비스 상태 확인
+// ==========================================
+
+/**
+ * Google TTS 서비스 상태 확인 엔드포인트
+ */
+exports.getTTSStatus = async (req, res, next) => {
+    try {
+        // 서비스 계정 파일 존재 여부 확인
+        const credentialsExist = fs.existsSync(GOOGLE_CREDENTIALS_PATH);
+
+        if (!credentialsExist) {
+            return res.json({
+                success: true,
+                data: {
+                    service: 'Google Cloud TTS',
+                    status: 'not_configured',
+                    message: '서비스 계정 JSON 파일이 업로드되지 않았습니다',
+                    credentialsUploaded: false,
+                    voices: ['female', 'male', 'female-neural', 'male-neural']
+                }
+            });
+        }
+
+        // Google TTS 상태 확인
+        const statusResult = await checkGoogleTTSStatus();
+
+        res.json({
+            success: true,
+            data: {
+                service: 'Google Cloud TTS',
+                status: statusResult.status ? 'ready' : 'unavailable',
+                message: statusResult.message,
+                credentialsUploaded: true,
+                voices: ['female', 'male', 'female-neural', 'male-neural']
+            }
+        });
+    } catch (error) {
+        res.json({
+            success: true,
+            data: {
+                service: 'Google Cloud TTS',
+                status: 'error',
+                error: error.message
+            }
+        });
+    }
+};
+
+// 서비스 계정 JSON 업로드
+exports.uploadTTSCredentials = async (req, res, next) => {
+    try {
+        const { credentials } = req.body;
+
+        if (!credentials) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'INVALID_INPUT', message: '서비스 계정 JSON 데이터가 필요합니다' }
+            });
+        }
+
+        // JSON 유효성 검사
+        let credentialsObj;
+        try {
+            credentialsObj = typeof credentials === 'string' ? JSON.parse(credentials) : credentials;
+        } catch (e) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'INVALID_JSON', message: '유효하지 않은 JSON 형식입니다' }
+            });
+        }
+
+        // 필수 필드 확인
+        if (!credentialsObj.type || !credentialsObj.project_id || !credentialsObj.private_key) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'INVALID_CREDENTIALS', message: '유효한 서비스 계정 JSON이 아닙니다. type, project_id, private_key 필드가 필요합니다.' }
+            });
+        }
+
+        // config 디렉토리 확인
+        const configDir = path.dirname(GOOGLE_CREDENTIALS_PATH);
+        if (!fs.existsSync(configDir)) {
+            fs.mkdirSync(configDir, { recursive: true });
+        }
+
+        // 파일 저장
+        fs.writeFileSync(GOOGLE_CREDENTIALS_PATH, JSON.stringify(credentialsObj, null, 2), 'utf8');
+
+        // TTS 클라이언트 재초기화
+        ttsClient = null;
+        initGoogleTTSClient();
+
+        // 연결 테스트
+        const statusResult = await checkGoogleTTSStatus();
+
+        return res.json({
+            success: true,
+            message: '서비스 계정이 성공적으로 업로드되었습니다',
+            projectId: credentialsObj.project_id,
+            connectionStatus: statusResult.status ? 'connected' : 'failed',
+            connectionMessage: statusResult.message
+        });
+
+    } catch (error) {
+        console.error('Upload credentials error:', error);
+        return res.status(500).json({
+            success: false,
+            error: { code: 'UPLOAD_ERROR', message: error.message }
+        });
+    }
+};
+
+// TTS 테스트 음성 생성
+exports.testTTS = async (req, res, next) => {
+    const startTime = Date.now();
+    const characterCount = req.body.text?.length || 0;
+
+    try {
+        const { text = '안녕하세요, 코키브 TTS 테스트입니다.', voice = 'female', speed = 1.0 } = req.body;
+        const actualCharCount = text.length;
+
+        // 서비스 계정 확인
+        if (!fs.existsSync(GOOGLE_CREDENTIALS_PATH)) {
+            return res.status(400).json({
+                success: false,
+                error: { code: 'NOT_CONFIGURED', message: '서비스 계정 JSON 파일이 업로드되지 않았습니다' }
+            });
+        }
+
+        const client = initGoogleTTSClient();
+        if (!client) {
+            return res.status(500).json({
+                success: false,
+                error: { code: 'CLIENT_ERROR', message: 'TTS 클라이언트 초기화 실패' }
+            });
+        }
+
+        const voiceConfig = getGoogleVoiceConfig(voice, speed);
+
+        const request = {
+            input: { text: text },
+            voice: voiceConfig.voice,
+            audioConfig: voiceConfig.audioConfig
+        };
+
+        const [response] = await client.synthesizeSpeech(request);
+        const responseTime = Date.now() - startTime;
+
+        if (!response.audioContent) {
+            // 실패 로깅
+            await aiService.logTTSUsage('google', actualCharCount, responseTime, false, 'No audio content', {
+                voice: voiceConfig.voice.name,
+                operationType: 'tts_test'
+            });
+            return res.status(500).json({
+                success: false,
+                error: { code: 'TTS_ERROR', message: '음성 생성 실패' }
+            });
+        }
+
+        // 성공 로깅 - API 사용량 추적 (테스트도 기록)
+        await aiService.logTTSUsage('google', actualCharCount, responseTime, true, null, {
+            voice: voiceConfig.voice.name,
+            operationType: 'tts_test',
+            audioLengthSeconds: Math.ceil(response.audioContent.length / 24000)
+        });
+
+        // Base64로 반환
+        return res.json({
+            success: true,
+            audioContent: response.audioContent.toString('base64'),
+            contentType: 'audio/mp3'
+        });
+
+    } catch (error) {
+        const responseTime = Date.now() - startTime;
+        // 에러 로깅
+        await aiService.logTTSUsage('google', characterCount || 0, responseTime, false, error.message, {
+            operationType: 'tts_test'
+        });
+        console.error('TTS test error:', error);
+        return res.status(500).json({
+            success: false,
+            error: { code: 'TTS_ERROR', message: error.message }
+        });
+    }
+};
+
+

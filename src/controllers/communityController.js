@@ -5,6 +5,7 @@
 
 const { query, queryOne, insert, update } = require('../config/database');
 const { HTTP_STATUS, ERROR_CODES, VOTE_TARGET_TYPES, PAGINATION } = require('../config/constants');
+const aiQnaService = require('../services/aiQnaService');
 
 // ===========================================
 // 질문 관련
@@ -145,7 +146,7 @@ exports.getQuestionById = async (req, res, next) => {
  */
 exports.createQuestion = async (req, res, next) => {
     try {
-        const { paperId, title, content } = req.body;
+        const { paperId, title, content, isPublic = true } = req.body;
         const userId = req.user.id;
 
         // 논문 존재 확인
@@ -161,7 +162,8 @@ exports.createQuestion = async (req, res, next) => {
             paper_id: paperId,
             user_id: userId,
             title,
-            content
+            content,
+            is_public: isPublic ? 1 : 0
         });
 
         res.status(HTTP_STATUS.CREATED).json({
@@ -559,6 +561,7 @@ exports.voteAnswer = async (req, res, next) => {
 
 /**
  * 특정 논문의 Q&A 목록
+ * 공개 질문 + 본인의 비공개 질문만 표시
  */
 exports.getPaperQuestions = async (req, res, next) => {
     try {
@@ -566,6 +569,7 @@ exports.getPaperQuestions = async (req, res, next) => {
         const page = parseInt(req.query.page) || PAGINATION.DEFAULT_PAGE;
         const limit = Math.min(parseInt(req.query.limit) || PAGINATION.DEFAULT_LIMIT, PAGINATION.MAX_LIMIT);
         const offset = (page - 1) * limit;
+        const userId = req.user?.id || null;
 
         // 논문 존재 확인
         const paper = await queryOne('SELECT id, title_ko as titleKo FROM papers WHERE id = ?', [paperId]);
@@ -576,10 +580,19 @@ exports.getPaperQuestions = async (req, res, next) => {
             });
         }
 
+        // 공개 질문 + 본인 비공개 질문 조건
+        let whereClause = 'q.paper_id = ? AND (q.is_public = 1';
+        const params = [paperId];
+        if (userId) {
+            whereClause += ' OR q.user_id = ?';
+            params.push(userId);
+        }
+        whereClause += ')';
+
         // 전체 개수 조회
         const countResult = await queryOne(
-            'SELECT COUNT(*) as total FROM questions WHERE paper_id = ?',
-            [paperId]
+            `SELECT COUNT(*) as total FROM questions q WHERE ${whereClause}`,
+            params
         );
         const total = countResult?.total || 0;
 
@@ -592,6 +605,7 @@ exports.getPaperQuestions = async (req, res, next) => {
                 q.title,
                 q.content,
                 q.view_count as viewCount,
+                q.is_public as isPublic,
                 q.created_at as createdAt,
                 q.updated_at as updatedAt,
                 u.nickname as authorNickname,
@@ -599,17 +613,25 @@ exports.getPaperQuestions = async (req, res, next) => {
                 (SELECT COUNT(*) FROM answers a WHERE a.question_id = q.id AND a.is_accepted = 1) as hasAcceptedAnswer
             FROM questions q
             LEFT JOIN users u ON q.user_id = u.id
-            WHERE q.paper_id = ?
+            WHERE ${whereClause}
             ORDER BY q.created_at DESC
             LIMIT ? OFFSET ?`,
-            [paperId, limit, offset]
+            [...params, limit, offset]
         );
+
+        // 사용자 정보를 포함한 응답 형식으로 변환
+        const formattedQuestions = (questions || []).map(q => ({
+            ...q,
+            user: {
+                nickname: q.authorNickname || '익명'
+            }
+        }));
 
         res.json({
             success: true,
             data: {
                 paper,
-                questions: questions || [],
+                questions: formattedQuestions,
                 pagination: {
                     page,
                     limit,
@@ -619,6 +641,101 @@ exports.getPaperQuestions = async (req, res, next) => {
             }
         });
     } catch (error) {
+        next(error);
+    }
+};
+
+// ===========================================
+// AI Q&A 관련
+// ===========================================
+
+/**
+ * AI Q&A 설정 조회
+ */
+exports.getAiQnaSettings = async (req, res, next) => {
+    try {
+        const settings = await aiQnaService.getAiQnaSettings();
+        res.json({
+            success: true,
+            data: settings
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * AI Q&A 설정 업데이트 (관리자용)
+ */
+exports.updateAiQnaSettings = async (req, res, next) => {
+    try {
+        const { enabled, model, baseCost, marginPercent, inputCostPer1m, outputCostPer1m } = req.body;
+
+        const updatedSettings = await aiQnaService.updateSettings({
+            enabled,
+            model,
+            baseCost,
+            marginPercent,
+            inputCostPer1m,
+            outputCostPer1m
+        });
+
+        res.json({
+            success: true,
+            data: updatedSettings
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * AI 답변 비용 예상
+ */
+exports.estimateAiAnswerCost = async (req, res, next) => {
+    try {
+        const { paperId } = req.params;
+
+        const estimate = await aiQnaService.estimateCost(paperId);
+
+        res.json({
+            success: true,
+            data: estimate
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * AI 답변 요청
+ */
+exports.requestAiAnswer = async (req, res, next) => {
+    try {
+        const { questionId } = req.params;
+        const userId = req.user.id;
+
+        // AI 답변 생성 및 저장
+        const result = await aiQnaService.createAiAnswer(parseInt(questionId), userId);
+
+        res.status(HTTP_STATUS.CREATED).json({
+            success: true,
+            data: {
+                answerId: result.answerId,
+                pointsDeducted: result.pointsDeducted,
+                remainingBalance: result.remainingBalance,
+                tokenUsage: result.tokenUsage,
+                processingTime: result.processingTime
+            }
+        });
+    } catch (error) {
+        // 포인트 부족 등 사용자 에러는 400으로 처리
+        if (error.message.includes('포인트') || error.message.includes('비활성화') || error.message.includes('이미')) {
+            return res.status(HTTP_STATUS.BAD_REQUEST).json({
+                success: false,
+                error: { code: ERROR_CODES.VALIDATION_ERROR, message: error.message }
+            });
+        }
         next(error);
     }
 };

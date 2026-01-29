@@ -99,4 +99,32 @@ router.post('/answers/:id/vote', authenticate, communityController.voteAnswer);
  */
 router.get('/papers/:paperId/questions', optionalAuth, communityController.getPaperQuestions);
 
+// ===========================================
+// AI Q&A 관련
+// ===========================================
+
+/**
+ * GET /api/v1/community/ai-qna/settings
+ * AI Q&A 설정 조회
+ */
+router.get('/ai-qna/settings', communityController.getAiQnaSettings);
+
+/**
+ * PUT /api/v1/community/ai-qna/settings
+ * AI Q&A 설정 업데이트 (관리자용)
+ */
+router.put('/ai-qna/settings', authenticate, communityController.updateAiQnaSettings);
+
+/**
+ * GET /api/v1/community/ai-qna/estimate/:paperId
+ * AI 답변 비용 예상
+ */
+router.get('/ai-qna/estimate/:paperId', authenticate, communityController.estimateAiAnswerCost);
+
+/**
+ * POST /api/v1/community/questions/:questionId/ai-answer
+ * AI 답변 요청
+ */
+router.post('/questions/:questionId/ai-answer', authenticate, communityController.requestAiAnswer);
+
 module.exports = router;

@@ -122,6 +122,12 @@ router.put('/ai-qna/settings', authenticate, communityController.updateAiQnaSett
 router.get('/ai-qna/estimate/:paperId', authenticate, communityController.estimateAiAnswerCost);
 
 /**
+ * GET /api/v1/community/questions/:questionId/estimate-cost
+ * 특정 질문에 대한 AI 답변 비용 예상 (질문 내용 기반)
+ */
+router.get('/questions/:questionId/estimate-cost', authenticate, communityController.estimateQuestionCost);
+
+/**
  * POST /api/v1/community/questions/:questionId/ai-answer
  * AI 답변 요청
  */

@@ -793,6 +793,8 @@
             align-items: center;
             gap: 4px;
             transition: transform 0.2s, box-shadow 0.2s;
+            position: relative;
+            overflow: hidden;
         }
 
         .btn-ai-answer:hover {
@@ -854,6 +856,41 @@
             margin-bottom: 1.5rem;
         }
 
+        .ai-confirm-info {
+            background: var(--bg-dark);
+            padding: 0.75rem;
+            border-radius: 8px;
+            margin: 1rem 0;
+            text-align: left;
+        }
+
+        .ai-confirm-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .ai-confirm-row:last-child {
+            margin-bottom: 0;
+        }
+
+        .ai-confirm-row .label {
+            color: var(--text-secondary);
+            font-weight: 600;
+            min-width: 50px;
+            flex-shrink: 0;
+        }
+
+        .ai-confirm-row .value {
+            color: var(--text-primary);
+            text-align: right;
+            flex: 1;
+            margin-left: 0.5rem;
+            word-break: break-word;
+        }
+
         .ai-confirm-cost {
             font-size: 2rem;
             font-weight: 700;
@@ -898,6 +935,8 @@
             background: linear-gradient(135deg, var(--primary), var(--secondary));
             border: none;
             color: white;
+            position: relative;
+            overflow: hidden;
         }
 
         .qa-answer-item:last-child {
@@ -921,6 +960,39 @@
             color: var(--text-secondary);
             line-height: 1.5;
             white-space: pre-wrap;
+        }
+
+        .qa-answer-content.collapsed {
+            max-height: 4.5em; /* 약 3줄 */
+            overflow: hidden;
+            position: relative;
+        }
+
+        .qa-answer-content.collapsed::after {
+            content: '';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 1.5em;
+            background: linear-gradient(to bottom, transparent, var(--bg-card));
+        }
+
+        .qa-expand-btn {
+            background: none;
+            border: none;
+            color: var(--primary);
+            cursor: pointer;
+            font-size: 0.85rem;
+            padding: 0.5rem 0;
+            margin-top: 0.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.25rem;
+        }
+
+        .qa-expand-btn:hover {
+            text-decoration: underline;
         }
 
         .qa-actions {
@@ -1408,10 +1480,20 @@
             </div>
             <div class="ai-confirm-body">
                 <p>AI가 논문을 분석하여 전문가 수준의 답변을 생성합니다.</p>
+                <div class="ai-confirm-info">
+                    <div class="ai-confirm-row">
+                        <span class="label">질문:</span>
+                        <span class="value" id="aiConfirmQuestionTitle"></span>
+                    </div>
+                    <div class="ai-confirm-row">
+                        <span class="label">논문:</span>
+                        <span class="value" id="aiConfirmPaperTitle"></span>
+                    </div>
+                </div>
                 <div class="ai-confirm-cost" id="aiConfirmCost">~60P</div>
                 <div class="ai-confirm-balance">보유 포인트: <strong id="aiConfirmBalance">0P</strong></div>
                 <div class="ai-confirm-note">
-                    ⚠️ 실제 비용은 논문 분량과 답변 길이에 따라 달라질 수 있습니다.
+                    ⚠️ 비용은 질문 내용과 논문 분량에 따라 계산됩니다.
                 </div>
             </div>
             <div class="ai-confirm-footer">
@@ -2022,17 +2104,6 @@
                             </button>
                         </div>
                     </div>
-                    <div class="translation-btn-group">
-                        <button id="infographicBtn" class="btn btn-infographic" onclick="requestInfographic(${paper.id})">
-                            📊 인포그래픽
-                        </button>
-                        <button id="translationBtnBasic" class="btn btn-outline btn-with-progress" onclick="requestTranslation(${paper.id}, 'basic')">
-                            📚 기본 번역
-                        </button>
-                        <button id="translationBtnAdvanced" class="btn btn-outline btn-with-progress" onclick="requestTranslation(${paper.id}, 'advanced')">
-                            ✨ 고급 번역
-                        </button>
-                    </div>
                 </div>
 
                 <!-- Summary Section -->
@@ -2101,6 +2172,19 @@
                     </a>
                 </section>
                 ` : ''}
+
+                <!-- 번역 버튼 그룹 -->
+                <div class="translation-btn-group">
+                    <button id="infographicBtn" class="btn btn-infographic" onclick="requestInfographic(${paper.id})">
+                        📊 인포그래픽
+                    </button>
+                    <button id="translationBtnBasic" class="btn btn-outline btn-with-progress" onclick="requestTranslation(${paper.id}, 'basic')">
+                        📚 기본 번역
+                    </button>
+                    <button id="translationBtnAdvanced" class="btn btn-outline btn-with-progress" onclick="requestTranslation(${paper.id}, 'advanced')">
+                        ✨ 고급 번역
+                    </button>
+                </div>
 
                 <!-- Q&A Section -->
                 <section class="qna-section">
@@ -2314,6 +2398,39 @@
 
         // 질문 데이터를 저장할 변수
         var paperQuestions = [];
+        // AI Q&A 설정 캐시
+        var aiQnaSettings = null;
+
+        // AI Q&A 설정 로드
+        async function loadAiQnaSettings() {
+            console.log('[loadAiQnaSettings] 시작, 캐시:', aiQnaSettings);
+            if (aiQnaSettings) return aiQnaSettings;
+            try {
+                const response = await api('/community/ai-qna/settings');
+                console.log('[loadAiQnaSettings] API 응답:', response);
+                if (response.success && response.data) {
+                    aiQnaSettings = response.data;
+                    console.log('[loadAiQnaSettings] 설정 저장됨:', aiQnaSettings);
+                    return aiQnaSettings;
+                }
+            } catch (error) {
+                console.error('[loadAiQnaSettings] AI Q&A 설정 로드 실패:', error);
+            }
+            console.log('[loadAiQnaSettings] 기본값 반환');
+            return { enabled: false, baseCost: 50 };
+        }
+
+        // AI 답변 예상 비용 계산
+        function getAiAnswerEstimatedCost() {
+            if (!aiQnaSettings) return '?';
+            // 간단 예상: 기본비용 + 예상 API 비용(약 2P) + 마진
+            const baseCost = aiQnaSettings.baseCost || 50;
+            const marginPercent = aiQnaSettings.marginPercent || 20;
+            const estimatedApiCost = 2; // 평균 약 2P
+            const subtotal = baseCost + estimatedApiCost;
+            const total = Math.ceil(subtotal * (1 + marginPercent / 100));
+            return total;
+        }
 
         // 현재 사용자가 수정/삭제 권한이 있는지 확인
         function canEditItem(itemUserId) {
@@ -2327,9 +2444,16 @@
         async function loadPaperQA(paperId) {
             const container = document.getElementById('qaList');
             try {
+                console.log('[loadPaperQA] 시작, paperId:', paperId);
+                // AI Q&A 설정 로드
+                await loadAiQnaSettings();
+                const aiCost = getAiAnswerEstimatedCost();
+
                 const response = await api(`/community/papers/${paperId}/questions`);
+                console.log('[loadPaperQA] 질문 목록 응답:', response);
                 // API 응답 구조: response.data.questions 또는 response.data (배열)
                 const questions = response.data?.questions || response.data || [];
+                console.log('[loadPaperQA] 질문 개수:', questions.length);
                 if (response.success && questions.length > 0) {
                     paperQuestions = questions;
 
@@ -2337,11 +2461,14 @@
                     const questionsWithAnswers = await Promise.all(questions.map(async (qa) => {
                         try {
                             const answersResponse = await api(`/community/questions/${qa.id}/answers`);
+                            console.log(`[loadPaperQA] 질문 ${qa.id} 답변:`, answersResponse.data);
                             return { ...qa, answers: answersResponse.success ? answersResponse.data : [] };
-                        } catch {
+                        } catch (error) {
+                            console.error(`[loadPaperQA] 질문 ${qa.id} 답변 로드 실패:`, error);
                             return { ...qa, answers: [] };
                         }
                     }));
+                    console.log('[loadPaperQA] 답변 포함 질문 목록:', questionsWithAnswers);
 
                     container.innerHTML = questionsWithAnswers.map(qa => {
                         const title = qa.title || '';
@@ -2352,6 +2479,7 @@
                         const authorName = qa.user?.nickname || '익명';
                         const hasAiAnswer = answers.some(a => a.isAiGenerated);
                         const isPrivate = qa.isPublic === false || qa.isPublic === 0;
+                        console.log(`[loadPaperQA] 질문 ${qa.id} - 답변: ${answers.length}, AI답변: ${hasAiAnswer}, 설정enabled: ${aiQnaSettings?.enabled}, AI버튼표시: ${!hasAiAnswer && aiQnaSettings?.enabled}`);
 
                         return `
                         <div class="qa-item">
@@ -2367,7 +2495,7 @@
                                     ` : ''}
                                 </div>
                                 <div style="display: flex; gap: 0.5rem;">
-                                    ${!hasAiAnswer ? `<button class="btn-ai-answer" onclick="openAiConfirmModal(${qa.id})" title="AI에게 전문가 답변 요청">🤖 AI 답변</button>` : ''}
+                                    ${!hasAiAnswer && aiQnaSettings?.enabled ? `<button class="btn-ai-answer btn-with-progress" id="aiAnswerBtn-${qa.id}" onclick="openAiConfirmModal(${qa.id})" title="AI에게 전문가 답변 요청 (${aiCost}P)">🤖 AI 답변(${aiCost}P)</button>` : ''}
                                     <button class="btn-answer" onclick="openAnswerModal(${qa.id})">답변하기</button>
                                 </div>
                             </div>
@@ -2390,7 +2518,8 @@
                                                     </div>
                                                 ` : ''}
                                             </div>
-                                            <div class="qa-answer-content" ${isAi ? 'style="white-space: pre-wrap;"' : ''}>${isAi ? formatMarkdown(a.content) : a.content}</div>
+                                            <div class="qa-answer-content ${isAi ? 'collapsed' : ''}" id="answer-${a.id}" ${isAi ? 'style="white-space: pre-wrap;"' : ''}>${isAi ? formatMarkdown(a.content) : a.content}</div>
+                                            ${isAi ? `<button class="qa-expand-btn" onclick="toggleAnswer(${a.id})"><span id="expand-text-${a.id}">▼ 더 보기</span></button>` : ''}
                                         </div>
                                     `}).join('')}
                                 </div>
@@ -3484,7 +3613,11 @@
         // ================== AI Q&A 기능 ==================
         var aiAnswerQuestionId = null;
 
-        async function openAiConfirmModal(questionId) {
+        // 모달 없이 바로 AI 답변 생성
+        async function generateAiAnswer(questionId) {
+            console.log('[generateAiAnswer] 시작, questionId:', questionId);
+
+            // 로그인 확인
             const token = window.KokiveAuth ? window.KokiveAuth.getToken() : localStorage.getItem('kokive_token');
             if (!token) {
                 showToast('로그인이 필요합니다.', 'warning');
@@ -3492,19 +3625,110 @@
                 return;
             }
 
-            aiAnswerQuestionId = questionId;
+            // 버튼 찾기
+            const btn = document.getElementById(`aiAnswerBtn-${questionId}`);
+            if (!btn) {
+                console.error('[generateAiAnswer] 버튼을 찾을 수 없음:', questionId);
+                return;
+            }
+
+            const originalText = btn.textContent;
+            btn.disabled = true;
+            btn.textContent = '⏳ 답변 생성 중...';
+
+            // 진행률 바 추가
+            let progressBar = btn.querySelector('.btn-progress-bar');
+            if (!progressBar) {
+                progressBar = document.createElement('div');
+                progressBar.className = 'btn-progress-bar';
+                btn.appendChild(progressBar);
+            }
+            progressBar.style.width = '0%';
+
+            // 진행률 시뮬레이션
+            let progress = 0;
+            const progressInterval = setInterval(() => {
+                progress += (95 - progress) * 0.02;
+                progressBar.style.width = Math.min(progress, 95) + '%';
+            }, 100);
 
             try {
-                // 비용 예상 조회
-                const costResponse = await api(`/community/ai-qna/estimate/${currentPaper.id}`);
+                console.log('[generateAiAnswer] API 호출 시작');
+                const response = await api(`/community/questions/${questionId}/ai-answer`, {
+                    method: 'POST'
+                });
+                console.log('[generateAiAnswer] API 응답:', response);
+
+                // 진행률 완료
+                clearInterval(progressInterval);
+                progressBar.style.width = '100%';
+
+                if (response.success) {
+                    console.log('[generateAiAnswer] 생성 성공');
+                    showToast(`AI 답변이 생성되었습니다! (${response.data.pointsDeducted}P 차감)`, 'success');
+
+                    // 잠시 후 버튼 제거 및 Q&A 새로고침
+                    setTimeout(async () => {
+                        console.log('[generateAiAnswer] Q&A 목록 새로고침');
+                        await loadPaperQA(currentPaper.id);
+                    }, 500);
+                } else {
+                    throw new Error(response.error?.message || 'AI 답변 생성에 실패했습니다.');
+                }
+            } catch (error) {
+                clearInterval(progressInterval);
+                console.error('[generateAiAnswer] 에러:', error);
+                showToast(error.message || 'AI 답변 생성에 실패했습니다.', 'error');
+
+                // 버튼 복구
+                btn.disabled = false;
+                btn.textContent = originalText;
+                if (progressBar) progressBar.style.width = '0%';
+            }
+        }
+
+        async function openAiConfirmModal(questionId) {
+            console.log('[openAiConfirmModal] 함수 호출됨, questionId:', questionId);
+            const token = window.KokiveAuth ? window.KokiveAuth.getToken() : localStorage.getItem('kokive_token');
+            console.log('[openAiConfirmModal] 토큰 확인:', token ? '있음' : '없음');
+            if (!token) {
+                showToast('로그인이 필요합니다.', 'warning');
+                window.location.href = `/login.html?redirect=${encodeURIComponent(window.location.href)}`;
+                return;
+            }
+
+            aiAnswerQuestionId = questionId;
+            console.log('[openAiConfirmModal] aiAnswerQuestionId 설정:', aiAnswerQuestionId);
+
+            try {
+                // 질문 기반 비용 예상 조회 (새로운 엔드포인트)
+                console.log('[openAiConfirmModal] 질문 기반 비용 예상 조회 시작, questionId:', questionId);
+                const costResponse = await api(`/community/questions/${questionId}/estimate-cost`);
+                console.log('[openAiConfirmModal] 비용 예상 응답:', costResponse);
+
                 if (costResponse.success && costResponse.data) {
-                    document.getElementById('aiConfirmCost').textContent = `~${costResponse.data.estimatedCost}P`;
+                    const estimate = costResponse.data;
+
+                    // 질문 제목 표시 (50자 제한)
+                    const questionTitle = estimate.questionTitle || '질문';
+                    document.getElementById('aiConfirmQuestionTitle').textContent =
+                        questionTitle.length > 50 ? questionTitle.substring(0, 50) + '...' : questionTitle;
+
+                    // 논문 제목 표시 (50자 제한)
+                    const paperTitle = estimate.paperTitle || currentPaper?.title_ko || currentPaper?.title || '논문';
+                    document.getElementById('aiConfirmPaperTitle').textContent =
+                        paperTitle.length > 50 ? paperTitle.substring(0, 50) + '...' : paperTitle;
+
+                    // 예상 비용 표시
+                    document.getElementById('aiConfirmCost').textContent = `${estimate.estimatedCost}P`;
                 }
 
                 // 사용자 포인트 잔액 조회
-                const userResponse = await api('/users/me');
+                console.log('[openAiConfirmModal] 사용자 포인트 조회 시작');
+                const userResponse = await api('/auth/me');
+                console.log('[openAiConfirmModal] 사용자 포인트 응답:', userResponse);
                 if (userResponse.success && userResponse.data) {
-                    const balance = userResponse.data.pointBalance || 0;
+                    const balance = userResponse.data.pointBalance || userResponse.data.points || 0;
                     document.getElementById('aiConfirmBalance').textContent = `${balance}P`;
 
                     // 포인트 부족 시 버튼 비활성화
@@ -3519,11 +3743,20 @@
                     }
                 }
             } catch (error) {
-                console.error('비용 예상 조회 실패:', error);
+                console.error('[openAiConfirmModal] 비용 예상 조회 실패:', error);
                 document.getElementById('aiConfirmCost').textContent = '~60P';
+                showToast('비용 예상에 실패했습니다.', 'error');
             }
 
-            document.getElementById('aiConfirmModal').classList.add('show');
+            console.log('[openAiConfirmModal] 모달 표시 시도');
+            const modal = document.getElementById('aiConfirmModal');
+            console.log('[openAiConfirmModal] 모달 요소:', modal);
+            if (modal) {
+                modal.classList.add('show');
+                console.log('[openAiConfirmModal] 모달 classList:', modal.classList);
+            } else {
+                console.error('[openAiConfirmModal] 모달 요소를 찾을 수 없음!');
+            }
         }
 
         function closeAiConfirmModal(event) {
@@ -3536,29 +3769,11 @@
         async function confirmAiAnswer() {
             if (!aiAnswerQuestionId) return;
 
-            const confirmBtn = document.getElementById('aiConfirmBtn');
-            const originalText = confirmBtn.textContent;
-            confirmBtn.disabled = true;
-            confirmBtn.textContent = '⏳ 생성 중...';
+            // 모달 닫기
+            closeAiConfirmModal();
 
-            try {
-                const response = await api(`/community/questions/${aiAnswerQuestionId}/ai-answer`, {
-                    method: 'POST'
-                });
-
-                if (response.success) {
-                    showToast(`AI 답변이 생성되었습니다! (${response.data.pointsDeducted}P 차감)`, 'success');
-                    closeAiConfirmModal();
-                    loadPaperQA(currentPaper.id);
-                } else {
-                    throw new Error(response.error?.message || 'AI 답변 생성에 실패했습니다.');
-                }
-            } catch (error) {
-                showToast(error.message || 'AI 답변 생성에 실패했습니다.', 'error');
-            } finally {
-                confirmBtn.disabled = false;
-                confirmBtn.textContent = originalText;
-            }
+            // generateAiAnswer 함수 호출 (이 함수가 모든 로딩 상태와 API 호출을 처리함)
+            await generateAiAnswer(aiAnswerQuestionId);
         }
 
         // 간단한 마크다운 포맷팅 (AI 답변용)
@@ -3580,6 +3795,22 @@
                 .replace(/\n\n/g, '</p><p style="margin: 0.75rem 0;">')
                 // 구분선 (---)
                 .replace(/^---$/gm, '<hr style="border: none; border-top: 1px solid var(--border-color); margin: 1rem 0;">');
+        }
+
+        // AI 답변 축약/펼침 토글
+        function toggleAnswer(answerId) {
+            const answerContent = document.getElementById(`answer-${answerId}`);
+            const expandText = document.getElementById(`expand-text-${answerId}`);
+
+            if (answerContent && expandText) {
+                if (answerContent.classList.contains('collapsed')) {
+                    answerContent.classList.remove('collapsed');
+                    expandText.textContent = '▲ 접기';
+                } else {
+                    answerContent.classList.add('collapsed');
+                    expandText.textContent = '▼ 더 보기';
+                }
+            }
         }
     </script>
 </body>

@@ -2495,7 +2495,7 @@
                                     ` : ''}
                                 </div>
                                 <div style="display: flex; gap: 0.5rem;">
-                                    ${!hasAiAnswer && aiQnaSettings?.enabled ? `<button class="btn-ai-answer btn-with-progress" id="aiAnswerBtn-${qa.id}" onclick="openAiConfirmModal(${qa.id})" title="AI에게 전문가 답변 요청 (${aiCost}P)">🤖 AI 답변(${aiCost}P)</button>` : ''}
+                                    ${!hasAiAnswer && aiQnaSettings?.enabled ? `<button class="btn-ai-answer btn-with-progress" id="aiAnswerBtn-${qa.id}" onclick="openAiConfirmModal(${qa.id})" title="AI에게 전문가 답변 요청">🤖 AI 답변</button>` : ''}
                                     <button class="btn-answer" onclick="openAnswerModal(${qa.id})">답변하기</button>
                                 </div>
                             </div>

@@ -3738,14 +3738,6 @@
                 clearInterval(progressInterval);
                 progressBar.style.width = '100%';
 
-                // 잠시 후 버튼 복구
-                setTimeout(() => {
-                    btn.disabled = false;
-                    btn.textContent = originalText;
-                    btn.classList.remove('btn-with-progress');
-                    progressBar.style.width = '0%';
-                }, 300);
-
                 if (costResponse.success && costResponse.data) {
                     const estimate = costResponse.data;
 
@@ -3782,6 +3774,7 @@
                         confirmBtn.textContent = 'AI 답변 받기';
                     }
                 }
+
                 // 모달 표시
                 console.log('[openAiConfirmModal] 모달 표시 시도');
                 const modal = document.getElementById('aiConfirmModal');
@@ -3792,6 +3785,14 @@
                 } else {
                     console.error('[openAiConfirmModal] 모달 요소를 찾을 수 없음!');
                 }
+
+                // 모달 표시 후 버튼 복구
+                setTimeout(() => {
+                    btn.disabled = false;
+                    btn.textContent = originalText;
+                    btn.classList.remove('btn-with-progress');
+                    progressBar.style.width = '0%';
+                }, 300);
             } catch (error) {
                 // 진행률 중지
                 clearInterval(progressInterval);

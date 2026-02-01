@@ -49,6 +49,7 @@ exports.getQuestions = async (req, res, next) => {
                 q.updated_at as updatedAt,
                 u.nickname as authorNickname,
                 p.title_ko as paperTitle,
+                p.primary_category as paperCategory,
                 (SELECT COUNT(*) FROM answers a WHERE a.question_id = q.id) as answerCount,
                 (SELECT COUNT(*) FROM answers a WHERE a.question_id = q.id AND a.is_accepted = 1) as hasAcceptedAnswer
             FROM questions q
@@ -97,6 +98,7 @@ exports.getQuestionById = async (req, res, next) => {
                 q.updated_at as updatedAt,
                 u.nickname as authorNickname,
                 p.title_ko as paperTitle,
+                p.primary_category as paperCategory,
                 p.arxiv_id as arxivId
             FROM questions q
             LEFT JOIN users u ON q.user_id = u.id
@@ -341,9 +343,17 @@ exports.getAnswers = async (req, res, next) => {
             [questionId]
         );
 
+        // 프론트엔드 호환을 위해 user 객체 추가
+        const formattedAnswers = (answers || []).map(a => ({
+            ...a,
+            user: {
+                nickname: a.isAiGenerated ? 'AI 전문가' : (a.authorNickname || '익명')
+            }
+        }));
+
         res.json({
             success: true,
-            data: answers || []
+            data: formattedAnswers
         });
     } catch (error) {
         next(error);
@@ -393,11 +403,19 @@ exports.updateAnswer = async (req, res, next) => {
         const userId = req.user.id;
 
         // 답변 존재 및 권한 확인
-        const answer = await queryOne('SELECT user_id FROM answers WHERE id = ?', [id]);
+        const answer = await queryOne('SELECT user_id, is_ai_generated FROM answers WHERE id = ?', [id]);
         if (!answer) {
             return res.status(HTTP_STATUS.NOT_FOUND).json({
                 success: false,
                 error: { code: ERROR_CODES.NOT_FOUND, message: 'Answer not found' }
+            });
+        }
+
+        // AI 답변은 수정 불가 (관리자도 프론트엔드 관리 페이지에서만 가능)
+        if (answer.is_ai_generated) {
+            return res.status(HTTP_STATUS.FORBIDDEN).json({
+                success: false,
+                error: { code: ERROR_CODES.INSUFFICIENT_PERMISSION, message: 'AI 답변은 수정할 수 없습니다.' }
             });
         }
 
@@ -697,6 +715,24 @@ exports.estimateAiAnswerCost = async (req, res, next) => {
         const { paperId } = req.params;
 
         const estimate = await aiQnaService.estimateCost(paperId);
+
+        res.json({
+            success: true,
+            data: estimate
+        });
+    } catch (error) {
+        next(error);
+    }
+};
+
+/**
+ * 질문별 AI 답변 비용 예상
+ */
+exports.estimateQuestionCost = async (req, res, next) => {
+    try {
+        const { questionId } = req.params;
+
+        const estimate = await aiQnaService.estimateQuestionCost(questionId);
 
         res.json({
             success: true,

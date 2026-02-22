@@ -1,12 +1,17 @@
 /**
  * KoKive AI Service
- * Claude API (번역/요약) + OpenAI API (임베딩) 하이브리드 구조
+ * Claude API (번역/요약) + OpenAI API (임베딩) + Gemini API 하이브리드 구조
  * 무료회원: Haiku, 유료회원: Sonnet
+ *
+ * admin 설정에 따라 동적으로 AI provider 선택:
+ * - paper_collection: Gemini 또는 Claude 선택 가능
  */
 
 const Anthropic = require('@anthropic-ai/sdk');
 const OpenAI = require('openai');
 const { insert, update, queryOne, query } = require('../config/database');
+const aiSettingsService = require('./aiSettingsService');
+const geminiService = require('./geminiService');
 
 // 번역 품질 등급
 const TRANSLATION_TIER = {
@@ -14,10 +19,10 @@ const TRANSLATION_TIER = {
     PREMIUM: 'sonnet'   // 유료 회원
 };
 
-// Claude 모델 매핑
+// Claude 모델 매핑 (API 키 접근 가능한 모델만 사용)
 const CLAUDE_MODELS = {
-    haiku: 'claude-3-5-haiku-20241022',
-    sonnet: 'claude-sonnet-4-20250514'
+    haiku: 'claude-3-haiku-20240307',       // Claude 3 Haiku (stable, API 접근 가능)
+    sonnet: 'claude-sonnet-4-20250514'      // Claude Sonnet 4 (API 접근 가능)
 };
 
 class AIService {
@@ -84,12 +89,183 @@ class AIService {
     }
 
     /**
-     * 논문 전체 처리 (번역 + 요약) - Haiku 버전 (무료/초기 처리)
+     * 논문 전체 처리 (번역 + 요약) - admin 설정에 따라 provider 선택
      * @param {Object} paper - 논문 데이터
      * @returns {Promise<Object>} - 처리 결과
      */
     async processPaper(paper) {
+        // admin 설정에서 paper_collection의 provider/model 확인
+        try {
+            const aiConfig = await aiSettingsService.getAiConfig('paper_collection');
+            const provider = aiConfig.provider || 'claude';
+            const model = aiConfig.model;
+
+            console.log(`[AI Service] paper_collection provider: ${provider}, model: ${model}`);
+
+            // Gemini 사용 설정인 경우
+            if (provider === 'gemini') {
+                return this.processPaperWithGemini(paper, model);
+            }
+        } catch (configError) {
+            console.warn('[AI Service] Failed to load AI settings, falling back to Claude:', configError.message);
+        }
+
+        // 기본값: Claude 사용
         return this.processPaperWithTier(paper, TRANSLATION_TIER.FREE);
+    }
+
+    /**
+     * Gemini를 사용한 논문 처리
+     * @param {Object} paper - 논문 데이터
+     * @param {string} model - Gemini 모델명
+     * @returns {Promise<Object>} - 처리 결과
+     */
+    async processPaperWithGemini(paper, model) {
+        const startTime = Date.now();
+
+        try {
+            // 제목 번역 (Gemini 사용)
+            const titleKo = await this.translateTitleWithGemini(paper.title_en, model);
+
+            // 초록 번역 (Gemini 사용)
+            const abstractKo = await this.translateAbstractWithGemini(paper.abstract_en, model);
+
+            // 요약 생성 (기존 geminiService 활용)
+            const summaryResult = await geminiService.generatePaperSummary({
+                titleEn: paper.title_en,
+                titleKo: titleKo,
+                abstractEn: paper.abstract_en,
+                abstractKo: abstractKo
+            }, paper.id);
+
+            const processingTime = Date.now() - startTime;
+
+            console.log(`[Gemini] 논문 처리 완료: ${paper.id}, ${processingTime}ms`);
+
+            return {
+                titleKo: titleKo,
+                abstractKo: abstractKo,
+                summary: {
+                    tldr: summaryResult.tldr || '',
+                    one_line_summary: summaryResult.one_line_summary || '',
+                    summary_3line: summaryResult.summary_3line || '',
+                    summary_detailed: summaryResult.summary_detailed || '',
+                    business_insight: summaryResult.business_insight || '',
+                    shorts_script: null
+                },
+                terms: summaryResult.terms || [],
+                tokensUsed: summaryResult.tokensUsed || 0,
+                processingTime: processingTime,
+                translationTier: 'gemini',
+                model: model
+            };
+        } catch (error) {
+            console.error(`[Gemini] 논문 처리 실패:`, error.message);
+            throw error;
+        }
+    }
+
+    /**
+     * Gemini로 제목 번역
+     */
+    async translateTitleWithGemini(titleEn, model) {
+        const https = require('https');
+        const apiKey = process.env.GEMINI_API_KEY;
+
+        if (!apiKey) {
+            throw new Error('GEMINI_API_KEY가 설정되지 않았습니다.');
+        }
+
+        const prompt = `다음 AI/ML 학술 논문 제목을 한국어로 번역해주세요. 기술 용어는 적절히 번역하거나 음역해주세요. 번역된 제목만 출력하세요.
+
+제목: ${titleEn}`;
+
+        const result = await this.callGeminiAPI(prompt, model, apiKey);
+        return result.text.trim();
+    }
+
+    /**
+     * Gemini로 초록 번역
+     */
+    async translateAbstractWithGemini(abstractEn, model) {
+        const apiKey = process.env.GEMINI_API_KEY;
+
+        if (!apiKey) {
+            throw new Error('GEMINI_API_KEY가 설정되지 않았습니다.');
+        }
+
+        const prompt = `다음 AI/ML 학술 논문 초록을 한국어로 번역해주세요. 기술적 정확성과 학술적 문체를 유지하며, 원문의 논리적 흐름을 보존해주세요. 번역된 초록만 출력하세요.
+
+초록:
+${abstractEn}`;
+
+        const result = await this.callGeminiAPI(prompt, model, apiKey);
+        return result.text.trim();
+    }
+
+    /**
+     * Gemini API 호출 (동적 모델)
+     */
+    async callGeminiAPI(prompt, model, apiKey) {
+        const https = require('https');
+
+        return new Promise((resolve, reject) => {
+            const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+            const url = new URL(apiUrl);
+
+            const requestBody = JSON.stringify({
+                contents: [{ parts: [{ text: prompt }] }],
+                generationConfig: {
+                    temperature: 0.7,
+                    maxOutputTokens: 4096,
+                    topP: 0.95,
+                    topK: 40
+                }
+            });
+
+            const options = {
+                hostname: url.hostname,
+                path: url.pathname + url.search,
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Content-Length': Buffer.byteLength(requestBody)
+                }
+            };
+
+            const req = https.request(options, (res) => {
+                let data = '';
+                res.on('data', chunk => { data += chunk; });
+                res.on('end', () => {
+                    try {
+                        const parsed = JSON.parse(data);
+
+                        if (parsed.error) {
+                            reject(new Error(parsed.error.message || 'Gemini API 오류'));
+                            return;
+                        }
+
+                        const text = parsed.candidates?.[0]?.content?.parts?.[0]?.text || '';
+                        const usageMetadata = parsed.usageMetadata || {};
+                        const tokensUsed = (usageMetadata.promptTokenCount || 0) +
+                            (usageMetadata.candidatesTokenCount || 0);
+
+                        resolve({ text, tokensUsed });
+                    } catch (e) {
+                        reject(new Error('응답 파싱 실패: ' + e.message));
+                    }
+                });
+            });
+
+            req.on('error', reject);
+            req.setTimeout(60000, () => {
+                req.destroy();
+                reject(new Error('Request timeout'));
+            });
+
+            req.write(requestBody);
+            req.end();
+        });
     }
 
     /**
@@ -157,25 +333,25 @@ ${abstractEn}
 다음 JSON 형식으로 응답해주세요:
 {
     "title_ko": "한국어 제목",
-    "abstract_ko": "한국어 초록 (학술적 문체)",
-    "tldr": "한 문장 요약 (최대 100자)",
-    "one_line_summary": "논문 리스트용 한줄 요약 (최대 150자) - '~를 연구했다' 형식",
-    "summary_3line": "세 줄 요약",
-    "summary_detailed": "HTML 형식의 쉬운 해설 (아래 형식 엄수)",
-    "business_insight": "비즈니스 시사점 (2-3문장)",
-    "shorts_script": {"hook": "오프닝", "main": "메인", "cta": "CTA"},
-    "terms": [{"term_en": "영어", "term_ko": "한국어", "definition": "정의"}]
+    "abstract_ko": "한국어 초록 (학술적 문체, 존대말)",
+    "tldr": "한 문장 요약 (최대 100자, 존대말)",
+    "one_line_summary": "논문 리스트용 한줄 요약 (최대 150자) - '~를 연구했습니다' 형식 (존대말)",
+    "summary_3line": "핵심1\n핵심2\n핵심3 (반드시 \\n으로 줄바꿈 구분, 존대말)",
+    "summary_detailed": "HTML 형식의 쉬운 해설 (아래 형식 엄수, 존대말)",
+    "business_insight": "비즈니스 시사점 (2-3문장, 존대말)",
+    "shorts_script": {"hook": "오프닝 (존대말)", "main": "메인 (존대말)", "cta": "CTA (존대말)"},
+    "terms": [{"term_en": "영어", "term_ko": "한국어", "definition": "정의 (존대말)"}]
 }
 
-★★★ summary_detailed 필수 형식 (HTML, 압축된 짧은 형태) ★★★
+★★★ summary_detailed 필수 형식 (HTML, 압축된 짧은 형태, 반드시 존대말) ★★★
 <div class="easy-explain">
 <p class="easy-title">📚 "비유를 포함한 한줄 제목"</p>
-<p><strong>1️⃣ 이게 뭔 연구야?</strong><br>일상 비유로 2-3문장 설명</p>
-<p><strong>2️⃣ 문제가 뭐야?</strong><br>해결하려는 문제 2-3문장</p>
-<p><strong>3️⃣ 어떻게 해결했어?</strong><br>핵심 방법 2-3문장</p>
-<p><strong>4️⃣ 결과는?</strong><br>성과를 숫자/비교로 1-2문장</p>
-<p><strong>5️⃣ 왜 중요해?</strong><br>의미 1-2문장</p>
-<p class="easy-summary">📌 <strong>한줄요약:</strong> 핵심 한 문장</p>
+<p><strong>1️⃣ 이 연구는 무엇인가요?</strong><br>일상 비유로 2-3문장 설명 (존대말)</p>
+<p><strong>2️⃣ 어떤 문제를 해결하나요?</strong><br>해결하려는 문제 2-3문장 (존대말)</p>
+<p><strong>3️⃣ 어떻게 해결했나요?</strong><br>핵심 방법 2-3문장 (존대말)</p>
+<p><strong>4️⃣ 결과는 어떤가요?</strong><br>성과를 숫자/비교로 1-2문장 (존대말)</p>
+<p><strong>5️⃣ 왜 중요한가요?</strong><br>의미 1-2문장 (존대말)</p>
+<p class="easy-summary">📌 <strong>한줄요약:</strong> 핵심 한 문장 (존대말)</p>
 </div>
 
 중요 지침:
@@ -183,7 +359,8 @@ ${abstractEn}
 2. 중학생 수준 (전문용어 최소화, 비유 필수)
 3. terms는 핵심 용어 5개
 4. 모든 내용 한국어
-5. JSON만 출력`
+5. ★★★ 반드시 존대말(~입니다, ~합니다, ~됩니다)로 작성하세요. 반말(~야, ~해, ~임) 절대 금지 ★★★
+6. JSON만 출력`
                 }
             ]
         });
@@ -373,34 +550,34 @@ ${abstractKo}
 
 다음 JSON 형식으로 응답해주세요:
 {
-    "tldr": "한 문장 요약 (최대 100자) - 핵심 기여를 포착",
-    "one_line_summary": "논문 리스트에 표시할 한줄 요약 (최대 150자) - '~를 연구했다', '~를 제안했다' 형식으로 핵심 내용 설명",
-    "summary_3line": "세 줄 요약 - 핵심 포인트를 각각 한 줄로",
-    "summary_detailed": "중학생도 이해할 수 있는 쉬운 해설 (500-800자). 다음 구조로 작성:
+    "tldr": "한 문장 요약 (최대 100자, 존대말) - 핵심 기여를 포착",
+    "one_line_summary": "논문 리스트에 표시할 한줄 요약 (최대 150자) - '~를 연구했습니다', '~를 제안했습니다' 형식 (존대말)",
+    "summary_3line": "핵심1\n핵심2\n핵심3 (반드시 \\n으로 줄바꿈 구분, 번호 없이, 존대말)",
+    "summary_detailed": "중학생도 이해할 수 있는 쉬운 해설 (500-800자, 존대말). 다음 구조로 작성:
 
 🎓 **쉬운 해설**
 
-1️⃣ **이게 뭔 연구야?**
-[연구 주제를 쉽게 설명, 비유 사용]
+1️⃣ **이 연구는 무엇인가요?**
+[연구 주제를 쉽게 설명, 비유 사용 - 존대말]
 
-2️⃣ **문제가 뭐야?**
-[해결하려는 문제를 일상적인 예시로 설명]
+2️⃣ **어떤 문제를 해결하나요?**
+[해결하려는 문제를 일상적인 예시로 설명 - 존대말]
 
-3️⃣ **어떻게 해결했어?**
-[핵심 방법을 간단히 설명, 기술 용어 최소화]
+3️⃣ **어떻게 해결했나요?**
+[핵심 방법을 간단히 설명, 기술 용어 최소화 - 존대말]
 
-4️⃣ **결과는?**
-[주요 성과를 숫자나 비교로 표현]
+4️⃣ **결과는 어떤가요?**
+[주요 성과를 숫자나 비교로 표현 - 존대말]
 
-5️⃣ **왜 중요해?**
-[이 연구가 가져올 변화나 의미]
+5️⃣ **왜 중요한가요?**
+[이 연구가 가져올 변화나 의미 - 존대말]
 
-📌 **한 줄 요약**: [핵심 내용을 한 문장으로]",
-    "business_insight": "비즈니스/산업 시사점 및 잠재적 응용 (2-3문장)",
+📌 **한 줄 요약**: [핵심 내용을 한 문장으로 - 존대말]",
+    "business_insight": "비즈니스/산업 시사점 및 잠재적 응용 (2-3문장, 존대말)",
     "shorts_script": {
-        "hook": "숏폼 영상용 주목을 끄는 오프닝 (1-2문장)",
-        "main": "연구를 설명하는 메인 콘텐츠 (3-4문장)",
-        "cta": "참여를 유도하는 CTA (1문장)"
+        "hook": "숏폼 영상용 주목을 끄는 오프닝 (1-2문장, 존대말)",
+        "main": "연구를 설명하는 메인 콘텐츠 (3-4문장, 존대말)",
+        "cta": "참여를 유도하는 CTA (1문장, 존대말)"
     }
 }
 
@@ -408,7 +585,8 @@ ${abstractKo}
 1. summary_detailed는 반드시 중학생 수준으로 쉽게 작성 (전문 용어 최소화, 비유 사용)
 2. one_line_summary는 논문 리스트에 제목과 함께 표시되므로 핵심만 간결하게
 3. 모든 내용은 한국어로 작성
-4. JSON만 출력하세요.`
+4. ★★★ 반드시 존대말(~입니다, ~합니다, ~됩니다)로 작성하세요. 반말(~야, ~해, ~임) 절대 금지 ★★★
+5. JSON만 출력하세요.`
                 }
             ]
         });
